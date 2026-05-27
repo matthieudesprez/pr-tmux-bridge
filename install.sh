@@ -5,9 +5,9 @@
 #   ./install.sh              # install/reload
 #   ./install.sh --uninstall  # stop and remove the agent
 #
-# After install, paste userscript/pr-tmux-bridge.user.js into Tampermonkey
-# (or your userscript manager) and visit a GitHub PR — the "→ tmux" button
-# should appear next to the PR title.
+# After install, open http://127.0.0.1:47811/userscript.js to install the
+# userscript (it carries the auth token), then visit a GitHub PR — the
+# "● tmux" button should appear next to the PR title.
 
 set -euo pipefail
 
@@ -17,6 +17,8 @@ PLIST_TEMPLATE="${REPO_ROOT}/launchd/be.lizy.pr-tmux-bridge.plist"
 LABEL="be.lizy.pr-tmux-bridge"
 PLIST_TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOG_PATH="${HOME}/Library/Logs/pr-tmux-bridge.log"
+CONFIG_DIR="${HOME}/.config/pr-tmux-bridge"
+CREATE_COMMAND_FILE="${CONFIG_DIR}/create-command"
 
 uninstall() {
     if [[ -f "${PLIST_TARGET}" ]]; then
@@ -33,11 +35,22 @@ if [[ "${1:-}" == "--uninstall" ]]; then
     exit 0
 fi
 
-if [[ ! -x "${DAEMON_PATH}" ]]; then
-    chmod +x "${DAEMON_PATH}"
-fi
+chmod +x "${DAEMON_PATH}" "${REPO_ROOT}/scripts/create-worktree.sh"
 
-mkdir -p "${HOME}/Library/LaunchAgents" "$(dirname "${LOG_PATH}")"
+mkdir -p "${HOME}/Library/LaunchAgents" "$(dirname "${LOG_PATH}")" "${CONFIG_DIR}"
+
+# Seed the create command (the provisioning step) if the user hasn't set one yet.
+# Defaults to the bundled git-worktree + tmux script; edit it to point at your own
+# worktree manager.
+if [[ ! -f "${CREATE_COMMAND_FILE}" ]]; then
+    cat > "${CREATE_COMMAND_FILE}" <<EOF
+# Command pr-tmux-bridge runs to provision a worktree + tmux session for a branch.
+# Tokens {branch} and {repo_root} are substituted as whole argv tokens (no shell).
+# Replace the line below with your own worktree manager if you use one.
+${REPO_ROOT}/scripts/create-worktree.sh {branch}
+EOF
+    echo "seeded ${CREATE_COMMAND_FILE}"
+fi
 
 # Substitute placeholders into the plist template.
 sed \
@@ -61,3 +74,9 @@ else
     echo "daemon did not respond on http://127.0.0.1:47811 — check ${LOG_PATH}"
     exit 1
 fi
+echo
+echo "Now install the userscript (Tampermonkey will prompt to confirm):"
+echo "    open 'http://127.0.0.1:47811/userscript.js'"
+echo
+echo "Installing from that URL bakes in the auth token. A hand-pasted copy of the"
+echo "raw file has a placeholder token and will be rejected with 401."
