@@ -18,7 +18,7 @@ LABEL="be.lizy.pr-tmux-bridge"
 PLIST_TARGET="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 LOG_PATH="${HOME}/Library/Logs/pr-tmux-bridge.log"
 CONFIG_DIR="${HOME}/.config/pr-tmux-bridge"
-CREATE_COMMAND_FILE="${CONFIG_DIR}/create-command"
+CONFIG_FILE="${CONFIG_DIR}/config"
 
 uninstall() {
     if [[ -f "${PLIST_TARGET}" ]]; then
@@ -39,17 +39,32 @@ chmod +x "${DAEMON_PATH}" "${REPO_ROOT}/scripts/create-worktree.sh"
 
 mkdir -p "${HOME}/Library/LaunchAgents" "$(dirname "${LOG_PATH}")" "${CONFIG_DIR}"
 
-# Seed the create command (the provisioning step) if the user hasn't set one yet.
-# Defaults to the bundled git-worktree + tmux script; edit it to point at your own
-# worktree manager.
-if [[ ! -f "${CREATE_COMMAND_FILE}" ]]; then
-    cat > "${CREATE_COMMAND_FILE}" <<EOF
-# Command pr-tmux-bridge runs to provision a worktree + tmux session for a branch.
+# Seed the config file if the user hasn't created one yet. CREATE_COMMAND defaults to
+# the bundled git-worktree + tmux script; edit it to point at your own worktree manager.
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+    cat > "${CONFIG_FILE}" <<EOF
+# pr-tmux-bridge configuration. Format: KEY=value, '#' starts a comment.
+# An env var PR_TMUX_BRIDGE_<KEY> overrides the matching line. Read live (no restart).
+
+# Command that provisions a worktree + tmux session for a branch.
 # Tokens {branch} and {repo_root} are substituted as whole argv tokens (no shell).
-# Replace the line below with your own worktree manager if you use one.
-${REPO_ROOT}/scripts/create-worktree.sh {branch}
+# Replace with your own worktree manager if you use one.
+CREATE_COMMAND=${REPO_ROOT}/scripts/create-worktree.sh {branch}
+
+# Terminal app to focus / spawn (e.g. Ghostty, iTerm, Terminal, WezTerm).
+# TERMINAL_APP=Ghostty
+
+# Search roots for local clones (os.pathsep-separated). Repos found as <root>/<name>
+# or by matching the clone's origin URL.
+# WORKSPACE=~/workspace
+
+# Worktree location used by scripts/create-worktree.sh.
+# WORKTREE_BASE=~/wt
+
+# JSON map for clones not found by the above.
+# REPOS={"owner/repo": "/path/to/clone"}
 EOF
-    echo "seeded ${CREATE_COMMAND_FILE}"
+    echo "seeded ${CONFIG_FILE}"
 fi
 
 # Substitute placeholders into the plist template.

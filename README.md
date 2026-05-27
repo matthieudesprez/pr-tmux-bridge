@@ -4,6 +4,12 @@ Jump from a GitHub PR (in the browser) to its tmux session. If no session
 exists for the PR's branch, optionally spawn a worktree + tmux session on the
 fly via a provisioning command you configure.
 
+![The tmux button on a GitHub PR header, dot green because a session exists](docs/button.png)
+
+The injected `● tmux` button sits in the PR header. The dot shows status at a
+glance: green = a session exists for the branch (click to jump), grey = none
+(click to spawn one).
+
 ## Pieces
 
 - `daemon/pr_tmux_bridge.py` — localhost HTTP daemon (Python 3, stdlib only)
@@ -27,9 +33,8 @@ bakes in the auth token):
 open 'http://127.0.0.1:47811/userscript.js'
 ```
 
-Tampermonkey will prompt to confirm the install. Open any GitHub PR — a
-`● tmux` button should appear next to the PR title, with a status dot:
-green = a session already exists (click to jump), grey = none (click to spawn).
+Tampermonkey will prompt to confirm the install. Open any GitHub PR and the
+`● tmux` button should appear next to the PR title.
 
 Do **not** hand-paste `userscript/pr-tmux-bridge.user.js`: its token is a
 `__TOKEN__` placeholder and the daemon will reject it with 401. Always install
@@ -59,34 +64,29 @@ so future versions land with one "Check for userscript updates" click.
 
 ## Provisioning command
 
-Creating a worktree + tmux session is a command **you configure** — there's no
-built-in default. The daemon resolves it from, in order:
+`CREATE_COMMAND` (in the config file) is what spawns the worktree + tmux
+session — there's no built-in default. It runs with cwd set to the repo root;
+the tokens `{branch}` and `{repo_root}` are substituted as whole argv elements
+after `shlex.split` (no shell, so a branch name can't be interpreted as a
+command). The other settings are exported to it as `PR_TMUX_BRIDGE_*` env vars.
 
-1. the env var `PR_TMUX_BRIDGE_CREATE_COMMAND`
-2. the file `~/.config/pr-tmux-bridge/create-command` (first non-comment line)
-
-It runs with cwd set to the repo root. The tokens `{branch}` and `{repo_root}`
-are substituted as whole argv elements after `shlex.split` — there's no shell,
-so a branch name can't be interpreted as a command.
-
-`install.sh` seeds the config file with the bundled reference script, which does
+`install.sh` seeds it with the bundled reference script, which does
 `git worktree add` + `tmux new-session`:
 
 ```
-/abs/path/scripts/create-worktree.sh {branch}
+CREATE_COMMAND=/abs/path/scripts/create-worktree.sh {branch}
 ```
 
-Swap that line for your own worktree manager if you use one (anything that
-provisions a checkout on `{branch}` and starts a tmux session in it works — the
-daemon just polls until a session for the branch appears). The config file is
-read live, so edits take effect without restarting the daemon.
+Swap it for any worktree manager — anything that provisions a checkout on
+`{branch}` and starts a tmux session in it works; the daemon just polls until a
+session for the branch appears.
 
 ## Repo resolution
 
 `/spawn` needs the PR's local clone. It's resolved in order:
 
-1. `PR_TMUX_BRIDGE_REPOS` override map
-2. `<root>/<repo>` by convention (for each search root)
+1. the `REPOS` override map
+2. `<root>/<repo>` by convention (for each `WORKSPACE` search root)
 3. a scan of each search root matching the clone's `origin` remote URL against
    `owner/repo` — so it works even when the local folder name differs from the
    GitHub repo name
@@ -102,15 +102,20 @@ defense), and CORS preflights are denied (the userscript uses
 `GM.xmlHttpRequest`, which bypasses CORS, so a preflight only ever comes from a
 cross-site `fetch` probe).
 
-## Configuration (env vars on the launchd plist or shell)
+## Configuration
 
-| Var | Default | Purpose |
+All settings live in `~/.config/pr-tmux-bridge/config` as `KEY=value` lines
+(`#` starts a comment), each overridable by an env var `PR_TMUX_BRIDGE_<KEY>`.
+The file is read live, so edits take effect without restarting the daemon — no
+launchd plist editing. `install.sh` seeds it on first install.
+
+| Key | Default | Purpose |
 |---|---|---|
-| `PR_TMUX_BRIDGE_TERMINAL_APP` | `Ghostty` | terminal app to focus/spawn |
-| `PR_TMUX_BRIDGE_WORKSPACE` | `~/workspace` | search root(s) for clones (`os.pathsep`-separated) |
-| `PR_TMUX_BRIDGE_REPOS` | `{}` | JSON map `{"owner/repo": "/path/to/clone"}` for non-convention paths |
-| `PR_TMUX_BRIDGE_CREATE_COMMAND` | (config file) | provisioning command; overrides the config file ({branch}, {repo_root} tokens) |
-| `PR_TMUX_BRIDGE_WORKTREE_BASE` | `~/wt` | read by `scripts/create-worktree.sh` for worktree location |
+| `CREATE_COMMAND` | (none) | command that provisions a worktree + tmux session (see above) |
+| `TERMINAL_APP` | `Ghostty` | terminal app to focus / spawn |
+| `WORKSPACE` | `~/workspace` | search root(s) for clones (`os.pathsep`-separated) |
+| `WORKTREE_BASE` | `~/wt` | worktree location for `scripts/create-worktree.sh` |
+| `REPOS` | `{}` | JSON map `{"owner/repo": "/path/to/clone"}` for clones not found otherwise |
 
 ## Endpoints
 

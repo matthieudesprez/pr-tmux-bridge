@@ -10,10 +10,10 @@ Endpoints (GET, JSON responses):
 
 All endpoints except /health and /userscript.js require the X-PR-Tmux-Token header.
 
-Provisioning a worktree + session is a user-configured command, taken from the env var
-PR_TMUX_BRIDGE_CREATE_COMMAND or the file ~/.config/pr-tmux-bridge/create-command. It runs
-with cwd set to the repo root; {branch} and {repo_root} are substituted as whole argv tokens
-(no shell). A reference implementation ships in scripts/create-worktree.sh.
+Settings come from ~/.config/pr-tmux-bridge/config (KEY=value lines), each overridable by an
+env var PR_TMUX_BRIDGE_<KEY>. The key one is CREATE_COMMAND: the command that provisions a
+worktree + session, run with cwd set to the repo root, with {branch}/{repo_root} substituted
+as whole argv tokens (no shell). A reference implementation ships in scripts/create-worktree.sh.
 
 Stdlib only. Run with: python3 pr_tmux_bridge.py
 """
@@ -34,24 +34,49 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import unquote, urlparse
 
 PORT = 47811
-TERMINAL_APP = os.environ.get("PR_TMUX_BRIDGE_TERMINAL_APP", "Ghostty")
-# Where local clones live. Colon-separated list; each entry holds repos as <root>/<name>.
-SEARCH_ROOTS = [
-    os.path.expanduser(part)
-    for part in os.environ.get("PR_TMUX_BRIDGE_WORKSPACE", "~/workspace").split(os.pathsep)
-    if part
-]
-try:
-    REPO_OVERRIDES: dict[str, str] = json.loads(os.environ.get("PR_TMUX_BRIDGE_REPOS", "{}"))
-except json.JSONDecodeError:
-    REPO_OVERRIDES = {}
-
-TOKEN_PATH = os.path.expanduser("~/.config/pr-tmux-bridge/token")
-CREATE_COMMAND_PATH = os.path.expanduser("~/.config/pr-tmux-bridge/create-command")
+CONFIG_DIR = os.path.expanduser("~/.config/pr-tmux-bridge")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
+TOKEN_PATH = os.path.join(CONFIG_DIR, "token")
 USERSCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "userscript", "pr-tmux-bridge.user.js")
 ALLOWED_HOSTS = frozenset({f"127.0.0.1:{PORT}", f"localhost:{PORT}"})
 TOKEN_HEADER = "X-PR-Tmux-Token"
+# Settings resolved per request via setting(); these are the built-in defaults.
+SETTING_DEFAULTS = {
+    "CREATE_COMMAND": "",  # no built-in default; must be configured to spawn
+    "TERMINAL_APP": "Ghostty",
+    "WORKSPACE": "~/workspace",  # os.pathsep-separated search roots
+    "WORKTREE_BASE": "~/wt",  # consumed by the create command, not the daemon
+    "REPOS": "{}",  # JSON map {"owner/repo": "/path/to/clone"}
+}
 LOG = logging.getLogger("pr-tmux-bridge")
+
+
+def _read_config_file() -> dict[str, str]:
+    """Parse the config file (KEY=value lines, # comments). Empty dict if absent."""
+    values: dict[str, str] = {}
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                values[key.strip()] = val.strip()
+    return values
+
+
+def setting(key: str) -> str:
+    """Resolve a setting: env PR_TMUX_BRIDGE_<key> > config file <key> > built-in default.
+
+    Read live so edits to the config file take effect without restarting the daemon.
+    """
+    env = os.environ.get(f"PR_TMUX_BRIDGE_{key}")
+    if env is not None and env.strip():
+        return env.strip()
+    file_val = _read_config_file().get(key)
+    if file_val is not None and file_val.strip():
+        return file_val.strip()
+    return SETTING_DEFAULTS.get(key, "")
 
 
 def load_or_create_token() -> str:
@@ -73,24 +98,39 @@ TOKEN = load_or_create_token()
 
 
 def load_create_command() -> str | None:
-    """Resolve the provisioning command from env, else the config file. None if unset.
+    """The configured provisioning command, or None if unset."""
+    return setting("CREATE_COMMAND") or None
 
-    Read live (not cached) so editing the config file takes effect without a restart.
+
+def search_roots() -> list[str]:
+    """Expanded list of roots to look for local clones under."""
+    return [os.path.expanduser(part) for part in setting("WORKSPACE").split(os.pathsep) if part]
+
+
+def repo_overrides() -> dict[str, str]:
+    """Parsed REPOS map, or empty dict on bad JSON."""
+    try:
+        return json.loads(setting("REPOS"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def create_command_env() -> dict[str, str]:
+    """Subprocess env for the create command: config settings exported as PR_TMUX_BRIDGE_*.
+
+    Lets the create command (e.g. scripts/create-worktree.sh) read settings like
+    WORKTREE_BASE from the config file even when the daemon runs under launchd.
     """
-    env = os.environ.get("PR_TMUX_BRIDGE_CREATE_COMMAND", "").strip()
-    if env:
-        return env
-    if os.path.exists(CREATE_COMMAND_PATH):
-        with open(CREATE_COMMAND_PATH, encoding="utf-8") as handle:
-            for raw in handle:
-                line = raw.strip()
-                if line and not line.startswith("#"):
-                    return line
-    return None
+    env = dict(os.environ)
+    for key in SETTING_DEFAULTS:
+        env[f"PR_TMUX_BRIDGE_{key}"] = setting(key)
+    return env
 
 
-def _run(cmd: list[str], check: bool = True, cwd: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, capture_output=True, text=True, check=check, cwd=cwd)
+def _run(
+    cmd: list[str], check: bool = True, cwd: str | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, cwd=cwd, env=env)
 
 
 def resolve_pr_branch(owner: str, repo: str, number: int) -> str:
@@ -135,7 +175,7 @@ def has_attached_client() -> bool:
 
 def focus_terminal() -> None:
     subprocess.run(
-        ["osascript", "-e", f'tell application "{TERMINAL_APP}" to activate'],
+        ["osascript", "-e", f'tell application "{setting("TERMINAL_APP")}" to activate'],
         check=False,
     )
 
@@ -148,7 +188,7 @@ def attach_session(session: str) -> None:
         return
     # No attached client: open a new terminal window running `tmux attach`.
     subprocess.run(
-        ["open", "-na", TERMINAL_APP, "--args", "-e", f"tmux attach -t {session}"],
+        ["open", "-na", setting("TERMINAL_APP"), "--args", "-e", f"tmux attach -t {session}"],
         check=False,
     )
 
@@ -178,17 +218,19 @@ def find_repo_root(owner: str, repo: str) -> str | None:
     Order: explicit override map, then <root>/<repo> by convention, then a scan of each
     search root matching the clone's `origin` URL (handles dir name != repo name).
     """
+    overrides = repo_overrides()
     key = f"{owner}/{repo}"
-    if key in REPO_OVERRIDES:
-        path = os.path.expanduser(REPO_OVERRIDES[key])
+    if key in overrides:
+        path = os.path.expanduser(overrides[key])
         return path if _is_git_repo(path) else None
 
-    for root in SEARCH_ROOTS:
+    roots = search_roots()
+    for root in roots:
         candidate = os.path.join(root, repo)
         if _is_git_repo(candidate):
             return candidate
 
-    for root in SEARCH_ROOTS:
+    for root in roots:
         try:
             entries = list(os.scandir(root))
         except OSError:
@@ -260,7 +302,7 @@ def create_session(command: str, repo_root: str, branch: str, timeout_s: float =
     may register the tmux session asynchronously after creating the worktree).
     """
     ensure_local_branch_tracks_remote(repo_root, branch)
-    _run(build_create_argv(command, branch, repo_root), cwd=repo_root)
+    _run(build_create_argv(command, branch, repo_root), cwd=repo_root, env=create_command_env())
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         session = find_session_for_branch(branch)
@@ -386,7 +428,7 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "error": "no local clone found",
                     "repo": f"{owner}/{repo}",
-                    "searched": SEARCH_ROOTS,
+                    "searched": search_roots(),
                     "hint": 'set PR_TMUX_BRIDGE_REPOS env var, e.g. {"owner/repo": "/path/to/clone"}',
                 },
             )
